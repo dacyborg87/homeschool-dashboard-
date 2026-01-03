@@ -1,16 +1,36 @@
-import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
 
-DB_PATH = "homeschool.db"
+# Optional Supabase support (Option 3)
+# If SUPABASE_URL / SUPABASE_ANON_KEY are present in Streamlit Secrets,
+# the app will use Supabase Postgres + Auth. Otherwise it falls back to local SQLite.
+USE_SUPABASE = False
+
+try:
+    from supabase import create_client  # type: ignore
+
+    SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
+    SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY", "")
+    if SUPABASE_URL and SUPABASE_ANON_KEY:
+        supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+        USE_SUPABASE = True
+    else:
+        supabase = None
+except Exception:
+    supabase = None
+
 
 # -----------------------------
-# Database helpers
+# SQLite fallback (local-only)
 # -----------------------------
+import sqlite3
+
+DB_PATH = "homeschool.db"
+
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute(
@@ -33,15 +53,15 @@ def db() -> sqlite3.Connection:
             test_name TEXT NOT NULL,
             score REAL NOT NULL,
             meta_json TEXT,
-            created_at INTEGER NOT NULL,
-            FOREIGN KEY(student_id) REFERENCES students(id)
+            created_at INTEGER NOT NULL
         )
         """
     )
     conn.commit()
     return conn
 
-def add_student(name: str, age: int | None, grade: str) -> None:
+
+def sqlite_add_student(name: str, age: Optional[int], grade: str) -> None:
     conn = db()
     conn.execute(
         "INSERT INTO students(name, age, grade, created_at) VALUES(?,?,?,?)",
@@ -49,12 +69,14 @@ def add_student(name: str, age: int | None, grade: str) -> None:
     )
     conn.commit()
 
-def get_students() -> pd.DataFrame:
+
+def sqlite_get_students() -> pd.DataFrame:
     conn = db()
     df = pd.read_sql_query("SELECT * FROM students ORDER BY created_at DESC", conn)
     return df
 
-def log_attempt(student_id: int, subject: str, test_name: str, score: float, meta_json: str = "") -> None:
+
+def sqlite_log_attempt(student_id: int, subject: str, test_name: str, score: float, meta_json: str = "") -> None:
     conn = db()
     conn.execute(
         "INSERT INTO attempts(student_id, subject, test_name, score, meta_json, created_at) VALUES(?,?,?,?,?,?)",
@@ -62,7 +84,8 @@ def log_attempt(student_id: int, subject: str, test_name: str, score: float, met
     )
     conn.commit()
 
-def get_attempts(student_id: int) -> pd.DataFrame:
+
+def sqlite_get_attempts(student_id: int) -> pd.DataFrame:
     conn = db()
     df = pd.read_sql_query(
         "SELECT * FROM attempts WHERE student_id = ? ORDER BY created_at DESC",
@@ -71,11 +94,87 @@ def get_attempts(student_id: int) -> pd.DataFrame:
     )
     return df
 
+
 # -----------------------------
-# Adaptive logic (simple + useful)
+# Supabase (Option 3)
 # -----------------------------
+
+def sb_sign_in(email: str, password: str) -> Dict:
+    assert supabase is not None
+    res = supabase.auth.sign_in_with_password({"email": email, "password": password})
+    # supabase-py returns an object with .session/.user; store minimal dict
+    session = getattr(res, "session", None)
+    user = getattr(res, "user", None)
+    if session is None or user is None:
+        raise RuntimeError("Login failed. Check email/password.")
+    return {
+        "access_token": session.access_token,
+        "refresh_token": session.refresh_token,
+        "user": {"id": user.id, "email": user.email},
+    }
+
+
+def sb_get_profile(user_id: str) -> Dict:
+    assert supabase is not None
+    data = supabase.table("profiles").select("id,email,role").eq("id", user_id).execute()
+    rows = getattr(data, "data", None) or []
+    if rows:
+        return rows[0]
+    # If profiles trigger wasn't installed yet, create a default profile row.
+    user_email = st.session_state.get("auth", {}).get("user", {}).get("email")
+    ins = supabase.table("profiles").insert({"id": user_id, "email": user_email, "role": "parent"}).execute()
+    rows2 = getattr(ins, "data", None) or []
+    return rows2[0] if rows2 else {"id": user_id, "email": user_email, "role": "parent"}
+
+
+def sb_get_students(family_id: str) -> pd.DataFrame:
+    assert supabase is not None
+    res = supabase.table("students").select("id,name,age,grade,created_at").eq("family_id", family_id).order("created_at", desc=True).execute()
+    rows = getattr(res, "data", None) or []
+    return pd.DataFrame(rows)
+
+
+def sb_add_student(family_id: str, name: str, age: Optional[int], grade: str) -> None:
+    assert supabase is not None
+    supabase.table("students").insert({
+        "family_id": family_id,
+        "name": name.strip(),
+        "age": int(age) if age else None,
+        "grade": grade.strip(),
+    }).execute()
+
+
+def sb_log_attempt(family_id: str, student_id: int, subject: str, test_name: str, score: float, meta: Dict) -> None:
+    assert supabase is not None
+    supabase.table("attempts").insert({
+        "family_id": family_id,
+        "student_id": int(student_id),
+        "subject": subject,
+        "test_name": test_name,
+        "score": float(score),
+        "meta_json": meta,
+    }).execute()
+
+
+def sb_get_attempts(family_id: str, student_id: int) -> pd.DataFrame:
+    assert supabase is not None
+    res = (
+        supabase.table("attempts")
+        .select("id,student_id,subject,test_name,score,meta_json,created_at")
+        .eq("family_id", family_id)
+        .eq("student_id", int(student_id))
+        .order("created_at", desc=True)
+        .execute()
+    )
+    rows = getattr(res, "data", None) or []
+    return pd.DataFrame(rows)
+
+
+# -----------------------------
+# Adaptive logic
+# -----------------------------
+
 def band_from_score(score: float) -> str:
-    # score in [0,100]
     if score < 50:
         return "Foundations"
     if score < 75:
@@ -83,6 +182,7 @@ def band_from_score(score: float) -> str:
     if score < 90:
         return "On Track"
     return "Advanced"
+
 
 def reading_plan(band: str) -> List[str]:
     if band == "Foundations":
@@ -111,6 +211,7 @@ def reading_plan(band: str) -> List[str]:
         "Writing (10 min): structured paragraph (claim → evidence → explain)",
     ]
 
+
 def math_plan(band: str) -> List[str]:
     if band == "Foundations":
         return [
@@ -136,6 +237,7 @@ def math_plan(band: str) -> List[str]:
         "Practice (10 min): challenge problem + explain reasoning",
     ]
 
+
 # -----------------------------
 # Question banks
 # -----------------------------
@@ -146,6 +248,7 @@ class MCQ:
     answer_index: int
     skill: str
 
+
 READING_MCQS: List[MCQ] = [
     MCQ("Which word is closest in meaning to 'happy'?", ["sad", "glad", "angry", "tired"], 1, "Vocabulary"),
     MCQ("In a story, the 'setting' is…", ["the problem", "where/when it happens", "the main character", "the ending"], 1, "Story Elements"),
@@ -153,6 +256,7 @@ READING_MCQS: List[MCQ] = [
     MCQ("A 'summary' should…", ["include every detail", "be the main points", "be only opinions", "be the first sentence"], 1, "Comprehension"),
     MCQ("An 'inference' is…", ["a guess based on clues", "a dictionary meaning", "a title", "a rhyme"], 0, "Comprehension"),
 ]
+
 
 MATH_MCQS: List[MCQ] = [
     MCQ("What is 37 + 25?", ["52", "62", "72", "82"], 2, "Addition"),
@@ -162,10 +266,12 @@ MATH_MCQS: List[MCQ] = [
     MCQ("If a rectangle is 6 by 4, its area is…", ["10", "20", "24", "30"], 2, "Geometry"),
 ]
 
+
 def run_mcq_test(test_name: str, bank: List[MCQ], key_prefix: str) -> Tuple[float, Dict[str, int]]:
     st.write(f"**{test_name}** — {len(bank)} questions")
     correct = 0
     misses_by_skill: Dict[str, int] = {}
+
     for i, q in enumerate(bank):
         choice = st.radio(q.prompt, q.options, key=f"{key_prefix}_{i}", index=None)
         if choice is None:
@@ -175,11 +281,48 @@ def run_mcq_test(test_name: str, bank: List[MCQ], key_prefix: str) -> Tuple[floa
         else:
             misses_by_skill[q.skill] = misses_by_skill.get(q.skill, 0) + 1
 
-    answered = sum(1 for i in range(len(bank)) if st.session_state.get(f"{key_prefix}_{i}") is not None)
+    answered = sum(
+        1 for i in range(len(bank))
+        if st.session_state.get(f"{key_prefix}_{i}") is not None
+    )
     if answered == 0:
         return 0.0, misses_by_skill
+
     score = (correct / len(bank)) * 100.0
     return score, misses_by_skill
+
+
+# -----------------------------
+# Auth UI (Supabase)
+# -----------------------------
+
+def render_auth_box() -> Optional[Dict]:
+    st.sidebar.markdown("## Login")
+    email = st.sidebar.text_input("Email", key="login_email")
+    password = st.sidebar.text_input("Password", type="password", key="login_password")
+
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        if st.button("Sign in"):
+            if not email or not password:
+                st.sidebar.error("Enter email + password")
+                return None
+            try:
+                auth = sb_sign_in(email, password)
+                st.session_state["auth"] = auth
+                st.sidebar.success("Signed in")
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(str(e))
+                return None
+
+    with col2:
+        if st.button("Sign out"):
+            st.session_state.pop("auth", None)
+            st.rerun()
+
+    return st.session_state.get("auth")
+
 
 # -----------------------------
 # UI
@@ -187,22 +330,49 @@ def run_mcq_test(test_name: str, bank: List[MCQ], key_prefix: str) -> Tuple[floa
 st.set_page_config(page_title="Homeschool Adaptive Dashboard", layout="wide")
 st.title("🏠 Homeschool Adaptive Dashboard")
 
-students_df = get_students()
+# If Supabase is configured, require login
+family_id = None
+role = "parent"
 
+if USE_SUPABASE:
+    auth = st.session_state.get("auth")
+    if not auth:
+        render_auth_box()
+        st.info("Log in to continue.")
+        st.stop()
+
+    family_id = auth["user"]["id"]
+    profile = sb_get_profile(family_id)
+    role = profile.get("role", "parent")
+
+    st.sidebar.markdown(f"**Role:** {role}")
+
+# Sidebar: Add Student (Admin + Parent only)
 with st.sidebar:
-    st.header("Add Student")
-    name = st.text_input("Name")
-    age = st.number_input("Age (optional)", min_value=0, max_value=25, value=0)
-    grade = st.text_input("Grade (optional)", placeholder="e.g., 4th")
-    if st.button("Create Student"):
-        if not name.strip():
-            st.error("Name is required.")
-        else:
-            add_student(name, int(age) if age else None, grade)
-            st.success("Student created.")
-            st.rerun()
+    if (not USE_SUPABASE) or role in ("admin", "parent"):
+        st.header("Add Student")
+        name = st.text_input("Name", key="new_student_name")
+        age = st.number_input("Age (optional)", min_value=0, max_value=25, value=0, key="new_student_age")
+        grade = st.text_input("Grade (optional)", placeholder="e.g., 4th", key="new_student_grade")
 
-if students_df.empty:
+        if st.button("Create Student"):
+            if not name.strip():
+                st.error("Name is required.")
+            else:
+                if USE_SUPABASE:
+                    sb_add_student(family_id, name, int(age) if age else None, grade)
+                else:
+                    sqlite_add_student(name, int(age) if age else None, grade)
+                st.success("Student created.")
+                st.rerun()
+
+# Load students
+if USE_SUPABASE:
+    students_df = sb_get_students(family_id)
+else:
+    students_df = sqlite_get_students()
+
+if students_df is None or len(students_df) == 0:
     st.info("Create a student profile in the sidebar to begin.")
     st.stop()
 
@@ -210,7 +380,12 @@ student_names = [f"{row['name']} (id:{row['id']})" for _, row in students_df.ite
 selected = st.selectbox("Select student", student_names)
 student_id = int(selected.split("id:")[1].replace(")", "").strip())
 
-tabs = st.tabs(["Assessments", "Results", "Adaptive Plan", "Admin"])
+# Tabs: Admin tab only for Admins
+base_tabs = ["Assessments", "Results", "Adaptive Plan"]
+if (not USE_SUPABASE) or role == "admin":
+    base_tabs.append("Admin")
+
+tabs = st.tabs(base_tabs)
 
 # ---- Assessments
 with tabs[0]:
@@ -219,13 +394,11 @@ with tabs[0]:
 
     with col1:
         st.markdown("### 📚 Reading Check")
-        st.caption("Do this first: answer MCQs, then enter Fluency + Comprehension info (you observe).")
+        st.caption("Answer MCQs, then enter Fluency + Comprehension (parent observes).")
         reading_score, reading_misses = run_mcq_test("Reading Mini-Assessment", READING_MCQS, "read")
         wpm = st.number_input("Fluency (Words Correct Per Minute) — enter after 1 minute read", min_value=0, max_value=300, value=0)
         comprehension_rating = st.slider("Comprehension (your rating)", 0, 10, 5)
 
-        # Simple combined score boost: MCQ 70%, comprehension 20%, fluency 10%
-        # (You can adjust later.)
         fluency_component = min(10.0, (wpm / 120.0) * 10.0)  # caps at 120 wpm
         combined_reading = (0.7 * reading_score) + (0.2 * (comprehension_rating * 10)) + (0.1 * (fluency_component * 10))
 
@@ -236,7 +409,10 @@ with tabs[0]:
                 "comprehension_rating_0_10": comprehension_rating,
                 "misses_by_skill": reading_misses,
             }
-            log_attempt(student_id, "Reading", "Baseline", combined_reading, str(meta))
+            if USE_SUPABASE:
+                sb_log_attempt(family_id, student_id, "Reading", "Baseline", combined_reading, meta)
+            else:
+                sqlite_log_attempt(student_id, "Reading", "Baseline", combined_reading, str(meta))
             st.success(f"Saved. Combined Reading Score: {combined_reading:.1f}")
             st.rerun()
 
@@ -247,18 +423,27 @@ with tabs[0]:
 
         if st.button("Save Math Result"):
             meta = {"mcq_score": math_score, "misses_by_skill": math_misses}
-            log_attempt(student_id, "Math", "Baseline", math_score, str(meta))
+            if USE_SUPABASE:
+                sb_log_attempt(family_id, student_id, "Math", "Baseline", math_score, meta)
+            else:
+                sqlite_log_attempt(student_id, "Math", "Baseline", math_score, str(meta))
             st.success(f"Saved. Math Score: {math_score:.1f}")
             st.rerun()
 
 # ---- Results
 with tabs[1]:
     st.subheader("Results History")
-    attempts = get_attempts(student_id)
-    if attempts.empty:
+
+    if USE_SUPABASE:
+        attempts = sb_get_attempts(family_id, student_id)
+    else:
+        attempts = sqlite_get_attempts(student_id)
+
+    if attempts is None or len(attempts) == 0:
         st.info("No results yet. Go to Assessments and save Reading and Math baselines.")
     else:
         st.dataframe(attempts, use_container_width=True)
+
         latest_read = attempts[attempts["subject"] == "Reading"].head(1)
         latest_math = attempts[attempts["subject"] == "Math"].head(1)
 
@@ -281,11 +466,16 @@ with tabs[1]:
 # ---- Adaptive Plan
 with tabs[2]:
     st.subheader("Adaptive Weekly Plan (auto-generated)")
-    attempts = get_attempts(student_id)
+
+    if USE_SUPABASE:
+        attempts = sb_get_attempts(family_id, student_id)
+    else:
+        attempts = sqlite_get_attempts(student_id)
 
     latest_read_score = None
     latest_math_score = None
-    if not attempts.empty:
+
+    if attempts is not None and len(attempts) > 0:
         r = attempts[attempts["subject"] == "Reading"].head(1)
         m = attempts[attempts["subject"] == "Math"].head(1)
         if not r.empty:
@@ -309,6 +499,7 @@ with tabs[2]:
             ("Writing (20 min)", "Sentence → paragraph. Use reading text for prompts."),
             ("Science/Social Studies (25 min)", "Short video/article + discussion + 5-min summary."),
         ]
+
         for title, detail in plan:
             st.markdown(f"**{title}**")
             st.write(detail)
@@ -316,13 +507,18 @@ with tabs[2]:
         st.markdown("### Friday (60–90 min)")
         st.write("- Re-test 1 short reading passage (WPM + 3 questions)\n- 10-question math check\n- Finish weekly mini-project")
 
-# ---- Admin
-with tabs[3]:
-    st.subheader("Admin")
-    st.caption("Basic utilities.")
-    if st.button("Reset database (DANGER)"):
-        conn = db()
-        conn.execute("DROP TABLE IF EXISTS attempts")
-        conn.execute("DROP TABLE IF EXISTS students")
-        conn.commit()
-        st.error("Database reset. Reload the page.")
+# ---- Admin (only if present)
+if ((not USE_SUPABASE) or role == "admin") and len(tabs) == 4:
+    with tabs[3]:
+        st.subheader("Admin")
+        st.caption("Admin-only actions.")
+
+        st.warning("Reset is disabled in cloud mode. Use Supabase to manage data.")
+
+        if not USE_SUPABASE:
+            if st.button("Reset database (DANGER)"):
+                conn = db()
+                conn.execute("DROP TABLE IF EXISTS attempts")
+                conn.execute("DROP TABLE IF EXISTS students")
+                conn.commit()
+                st.error("Database reset. Reload the page.")
