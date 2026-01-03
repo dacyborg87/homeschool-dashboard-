@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+homeschool.db
+.DS_Store
+.streamlit/
