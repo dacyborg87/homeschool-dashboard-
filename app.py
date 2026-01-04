@@ -341,6 +341,17 @@ if USE_SUPABASE:
         st.info("Log in to continue.")
         st.stop()
 
+    # 🔐 IMPORTANT: Re-apply Supabase session on EVERY rerun so PostgREST uses the JWT (RLS needs this)
+    try:
+        if supabase is not None:
+            supabase.auth.set_session(auth["access_token"], auth["refresh_token"])
+    except Exception:
+        try:
+            if supabase is not None:
+                supabase.postgrest.auth(auth["access_token"])
+        except Exception:
+            pass
+
     family_id = auth["user"]["id"]
     profile = sb_get_profile(family_id)
     role = profile.get("role", "parent")
