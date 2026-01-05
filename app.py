@@ -327,8 +327,9 @@ def render_auth_box() -> Optional[Dict]:
 # -----------------------------
 # UI
 # -----------------------------
-st.set_page_config(page_title="Homeschool Adaptive Dashboard", layout="wide")
-st.title("🏠 Homeschool Adaptive Dashboard")
+st.set_page_config(page_title="Jones Academy", layout="wide")
+st.title("🏫 Jones Academy")
+st.caption("Personalized Homeschool Dashboard")
 
 # If Supabase is configured, require login
 family_id = None
