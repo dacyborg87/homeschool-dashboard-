@@ -15,13 +15,16 @@ try:
 
     SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
     SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY", "")
+    LOGO_URL = st.secrets.get("LOGO_URL", "")
     if SUPABASE_URL and SUPABASE_ANON_KEY:
         supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
         USE_SUPABASE = True
     else:
         supabase = None
+        LOGO_URL = st.secrets.get("LOGO_URL", "")
 except Exception:
     supabase = None
+    LOGO_URL = st.secrets.get("LOGO_URL", "")
 
 
 # -----------------------------
@@ -325,15 +328,90 @@ def render_auth_box() -> Optional[Dict]:
 
 
 # -----------------------------
+# Kid-friendly UI helpers
+# -----------------------------
+
+def render_brand_header() -> None:
+    """Top-of-page brand header with optional logo."""
+    if LOGO_URL:
+        # Center the logo
+        st.markdown(
+            f"""
+            <div style='display:flex; justify-content:center; margin-top:10px; margin-bottom:10px;'>
+              <img src='{LOGO_URL}' style='max-width:520px; width:90%; height:auto;' />
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def render_welcome(student_label: str, kid_mode: bool) -> None:
+    """Welcome screen. In kid mode it becomes the main navigation."""
+    render_brand_header()
+
+    st.markdown(
+        """
+        <div style='text-align:center;'>
+          <h2 style='margin-bottom:0;'>Welcome to Jones Academy ✨</h2>
+          <p style='opacity:0.85; margin-top:6px;'>Pick what you want to do today.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("📚 Start Reading", use_container_width=True):
+            st.session_state["active_tab"] = "Assessments"
+            st.session_state["focus_subject"] = "Reading"
+            st.rerun()
+    with col2:
+        if st.button("➗ Start Math", use_container_width=True):
+            st.session_state["active_tab"] = "Assessments"
+            st.session_state["focus_subject"] = "Math"
+            st.rerun()
+    with col3:
+        if st.button("🗓️ Today's Plan", use_container_width=True):
+            st.session_state["active_tab"] = "Adaptive Plan"
+            st.session_state["focus_subject"] = None
+            st.rerun()
+
+    st.divider()
+
+    # Simple fun progress widget (local-only; we can persist later)
+    stars = int(st.session_state.get("stars", 0))
+    st.markdown(
+        f"<div style='text-align:center; font-size:20px;'>⭐ Stars earned today: <b>{stars}</b></div>",
+        unsafe_allow_html=True,
+    )
+
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("✅ I finished a task", use_container_width=True):
+            st.session_state["stars"] = stars + 1
+            st.success("Nice! +1 star ⭐")
+            st.rerun()
+    with colB:
+        if st.button("🔄 Reset stars (today)", use_container_width=True):
+            st.session_state["stars"] = 0
+            st.rerun()
+
+    if not kid_mode:
+        st.info("Tip: Turn on **Student Mode** in the sidebar to lock this down for the kids.")
+
+# -----------------------------
 # UI
 # -----------------------------
 st.set_page_config(page_title="Jones Academy", layout="wide")
+# Use a branded header; the H1 title remains for accessibility/search
 st.title("🏫 Jones Academy")
 st.caption("Personalized Homeschool Dashboard")
 
 # If Supabase is configured, require login
 family_id = None
 role = "parent"
+if "student_mode" not in st.session_state:
+    st.session_state["student_mode"] = False
 
 if USE_SUPABASE:
     auth = st.session_state.get("auth")
@@ -358,10 +436,15 @@ if USE_SUPABASE:
     role = profile.get("role", "parent")
 
     st.sidebar.markdown(f"**Role:** {role}")
+    # Kid-safe mode toggle (locks down the UI)
+    if role in ("admin", "parent"):
+        st.sidebar.toggle("Student Mode (Kid-safe)", key="student_mode", value=bool(st.session_state.get("student_mode", False)))
+    else:
+        st.session_state["student_mode"] = True
 
 # Sidebar: Add Student (Admin + Parent only)
 with st.sidebar:
-    if (not USE_SUPABASE) or role in ("admin", "parent"):
+    if (not st.session_state.get("student_mode", False)) and ((not USE_SUPABASE) or role in ("admin", "parent")):
         st.header("Add Student")
         name = st.text_input("Name", key="new_student_name")
         age = st.number_input("Age (optional)", min_value=0, max_value=25, value=0, key="new_student_age")
@@ -390,18 +473,48 @@ if students_df is None or len(students_df) == 0:
 
 student_names = [f"{row['name']} (id:{row['id']})" for _, row in students_df.iterrows()]
 selected = st.selectbox("Select student", student_names)
+# Store selected student name for the Welcome screen
+try:
+    st.session_state["selected_student_name"] = selected.split(" (id:")[0]
+except Exception:
+    pass
 student_id = int(selected.split("id:")[1].replace(")", "").strip())
 
-# Tabs: Admin tab only for Admins
-base_tabs = ["Assessments", "Results", "Adaptive Plan"]
+kid_mode = bool(st.session_state.get("student_mode", False))
+
+# Tabs
+base_tabs = ["Welcome", "Assessments", "Results", "Adaptive Plan"]
 if (not USE_SUPABASE) or role == "admin":
     base_tabs.append("Admin")
 
+# In kid mode, hide Results/Admin
+if kid_mode:
+    base_tabs = ["Welcome", "Assessments", "Adaptive Plan"]
+
+# Track active tab preference
+if "active_tab" not in st.session_state:
+    st.session_state["active_tab"] = "Welcome"
+
 tabs = st.tabs(base_tabs)
 
-# ---- Assessments
+# ---- Welcome
 with tabs[0]:
+    # Student label for the welcome screen
+    student_label = ""
+    try:
+        # If a student is already selected, show their name
+        if "selected_student_name" in st.session_state:
+            student_label = st.session_state["selected_student_name"]
+    except Exception:
+        pass
+
+    render_welcome(student_label, kid_mode)
+
+# ---- Assessments
+with tabs[1]:
     st.subheader("Baseline Assessments")
+    if kid_mode:
+        st.success("Kid Mode is ON ✅  Ask a parent for help with the 1-minute reading timer.")
     col1, col2 = st.columns(2)
 
     with col1:
@@ -443,40 +556,41 @@ with tabs[0]:
             st.rerun()
 
 # ---- Results
-with tabs[1]:
-    st.subheader("Results History")
+if not kid_mode:
+    with tabs[2]:
+        st.subheader("Results History")
 
-    if USE_SUPABASE:
-        attempts = sb_get_attempts(family_id, student_id)
-    else:
-        attempts = sqlite_get_attempts(student_id)
+        if USE_SUPABASE:
+            attempts = sb_get_attempts(family_id, student_id)
+        else:
+            attempts = sqlite_get_attempts(student_id)
 
-    if attempts is None or len(attempts) == 0:
-        st.info("No results yet. Go to Assessments and save Reading and Math baselines.")
-    else:
-        st.dataframe(attempts, use_container_width=True)
+        if attempts is None or len(attempts) == 0:
+            st.info("No results yet. Go to Assessments and save Reading and Math baselines.")
+        else:
+            st.dataframe(attempts, use_container_width=True)
 
-        latest_read = attempts[attempts["subject"] == "Reading"].head(1)
-        latest_math = attempts[attempts["subject"] == "Math"].head(1)
+            latest_read = attempts[attempts["subject"] == "Reading"].head(1)
+            latest_math = attempts[attempts["subject"] == "Math"].head(1)
 
-        colA, colB = st.columns(2)
-        with colA:
-            st.markdown("### Latest Reading")
-            if not latest_read.empty:
-                score = float(latest_read.iloc[0]["score"])
-                st.metric("Reading score", f"{score:.1f}", band_from_score(score))
-            else:
-                st.write("No reading score yet.")
-        with colB:
-            st.markdown("### Latest Math")
-            if not latest_math.empty:
-                score = float(latest_math.iloc[0]["score"])
-                st.metric("Math score", f"{score:.1f}", band_from_score(score))
-            else:
-                st.write("No math score yet.")
+            colA, colB = st.columns(2)
+            with colA:
+                st.markdown("### Latest Reading")
+                if not latest_read.empty:
+                    score = float(latest_read.iloc[0]["score"])
+                    st.metric("Reading score", f"{score:.1f}", band_from_score(score))
+                else:
+                    st.write("No reading score yet.")
+            with colB:
+                st.markdown("### Latest Math")
+                if not latest_math.empty:
+                    score = float(latest_math.iloc[0]["score"])
+                    st.metric("Math score", f"{score:.1f}", band_from_score(score))
+                else:
+                    st.write("No math score yet.")
 
 # ---- Adaptive Plan
-with tabs[2]:
+with tabs[-1 if kid_mode else 3]:
     st.subheader("Adaptive Weekly Plan (auto-generated)")
 
     if USE_SUPABASE:
@@ -520,8 +634,8 @@ with tabs[2]:
         st.write("- Re-test 1 short reading passage (WPM + 3 questions)\n- 10-question math check\n- Finish weekly mini-project")
 
 # ---- Admin (only if present)
-if ((not USE_SUPABASE) or role == "admin") and len(tabs) == 4:
-    with tabs[3]:
+if (not kid_mode) and (((not USE_SUPABASE) or role == "admin") and ("Admin" in base_tabs)):
+    with tabs[-1]:
         st.subheader("Admin")
         st.caption("Admin-only actions.")
 
